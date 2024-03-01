@@ -1,6 +1,6 @@
 {
-  "data_file": "data/covid19-unrecognized-requests.csv",
-  "output_file": "output/covid19-clusters-min-size-10-solution.json",
-  "example_solution_file": "examples/covid19-clusters-min-size-10-solution.json",
+  "data_file": "data/banking-unrecognized-requests.csv",
+  "output_file": "output/banking-clusters-min-size-10-solution.json",
+  "example_solution_file": "examples/banking-clusters-min-size-10-solution.json",
   "min_cluster_size": "10"
 }

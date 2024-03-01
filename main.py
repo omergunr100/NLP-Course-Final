@@ -5,10 +5,8 @@ import benepar, spacy
 import en_core_web_md
 import numpy as np
 import pandas as pd
-from matplotlib import pyplot as plt
-from matplotlib.axes import Axes
+import plotly.express as px
 from matplotlib.figure import Figure
-from mpl_toolkits.mplot3d import Axes3D
 from pandas import DataFrame
 from sentence_transformers import SentenceTransformer
 from sklearn.decomposition import PCA
@@ -23,9 +21,16 @@ nlp = en_core_web_md.load()
 nlp.add_pipe("benepar", config={"model": "benepar_en3"})
 
 
+# clean the query text for processing
+def clean_query(query: str) -> str:
+    return query.lower().strip('\r\n')
+
+
 # create a line generator from filename
 def read_lines(filename: str) -> DataFrame:
-    return pd.read_csv(filename)
+    df = pd.read_csv(filename)
+    df['text'] = df['text'].map(clean_query)
+    return df
 
 
 # create a sentence transformer model
@@ -159,6 +164,9 @@ def title_clusters(df: DataFrame, clusters: dict, min_size: int):
 
             # set the most similar as the title
             value['title'] = max_str.strip('.')
+            df.loc[df['cluster'] == key, 'title'] = value['title']
+
+    df.loc[df['cluster'].isna(), 'title'] = 'unclustered'
 
 
 # reduces the dimensionality of the data to k dimensions
@@ -169,44 +177,15 @@ def reduce_dimensions(df: DataFrame, dims: int):
         df[f'reduced{str(i)}'] = reduced[:, i]
 
 
-# plots a cluster on a figure
-def plot_cluster(ax: Axes, df: DataFrame, clusters: dict, key: str | None) -> Axes:
-    if key:
-        filtered_df = df[df['cluster'] == key]
-    elif len(clusters) > 0:
-        filtered_df = df[df['cluster'].isna()]
-    else:
-        filtered_df = df
-
-    ax.scatter(filtered_df['reduced0'].to_numpy(),
-               filtered_df['reduced1'].to_numpy(),
-               filtered_df['reduced2'].to_numpy(),
-               label=key if key else 'unclustered')
-    return ax
-
-
-# plot results
-def plot_results(df: DataFrame, clusters: dict, subplot: bool = False) -> Figure:
-    plt.clf()
-
-    if subplot:
-        fig = plt.figure()
-        for key in list(clusters.keys()) + [None]:
-            ax = fig.add_subplot(projection='3d')
-            ax.set_xlabel('dim0')
-            ax.set_ylabel('dim1')
-            ax.set_zlabel('dim2')
-            plot_cluster(ax, df, clusters, key)
-            ax.set_title(key if key else 'unclustered')
-    else:
-        fig = plt.figure()
-        ax = fig.add_subplot(projection='3d')
-        ax.set_xlabel('dim0')
-        ax.set_ylabel('dim1')
-        ax.set_zlabel('dim2')
-        for key in list(clusters.keys()) + [None]:
-            plot_cluster(ax, df, clusters, key)
-    plt.show()
+# plot results - plotly
+def plot_results(df: DataFrame,
+                 axis: tuple[str, str, str] | None = ('reduced0', 'reduced1', 'reduced2'),
+                 color: str = 'cluster') -> Figure:
+    x, y, z = axis
+    fig = px.scatter_3d(df, x=x, y=y, z=z,
+                        size_max=1.5,
+                        color=color if color in df else None)
+    fig.show()
     return fig
 
 
@@ -241,6 +220,7 @@ def analyze_unrecognized_requests(data_file, output_file, min_size):
     model = create_sentence_transformer_model()
     # create dataframe of the data
     df = read_lines(data_file)
+    df.reset_index(inplace=True)
     # encode the sentences to the dataframe
     encode_sentences(df, model)
     # create a dictionary of clusters
@@ -251,36 +231,37 @@ def analyze_unrecognized_requests(data_file, output_file, min_size):
     reduce_dimensions(df, dims)
 
     # go through the dataframe and match the sentences to the clusters
-    threshold = 0.85
-    for i in range(max_iterations := 15):
-        # randomize the row order
-        df = df.sample(frac=1, random_state=42)
+    threshold = 0.80
+    for i in range(hyper_iterations := 2):
+        for j in range(max_iterations := 12):
+            # randomize the row order
+            df = df.sample(frac=1, random_state=42)
 
-        # plot the results
-        plot_results(df, clusters)
+            # do a single iteration of the clustering algorithm
+            if iterate_once(df, clusters, threshold):
+                print("Converged after", j + 1, "iterations!")
+                break
 
-        # do a single iteration of the clustering algorithm
-        if iterate_once(df, clusters, threshold):
-            print("Converged after", i + 1, "iterations!")
+            print("Iteration", j + 1, "done")
 
-            # filter the clusters
-            filter_clusters(df, clusters, int(min_size))
+        # filter the clusters
+        filter_clusters(df, clusters, int(min_size))
 
-            # iterate last time to match abandoned sentences to existing clusters
-            iterate_once(df, clusters, threshold, create_centroids=False)
+        # iterate last time to match abandoned sentences to existing clusters
+        iterate_once(df, clusters, threshold, create_centroids=False)
 
-            # plot the results
-            plot_results(df, clusters)
-
-            break
-
-        print("Iteration", i + 1, "done")
+        print("Hyper iteration", i + 1, "done")
 
     # give each cluster a title based on the sentences in the cluster
     title_clusters(df, clusters, int(min_size))
 
     # save the clustering results to a json file
     save_clusters(df=df, clusters=clusters, output_file=output_file)
+
+    # plot the results
+    plot_results(df, color='title')
+
+    return df
 
     # todo: implement this function
     #  you are encouraged to break the functionality into multiple functions,
