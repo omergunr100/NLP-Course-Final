@@ -1,6 +1,6 @@
 import json
 from collections import defaultdict
-from typing import Any
+from typing import Any, Dict
 
 # noinspection PyUnresolvedReferences
 import benepar, spacy
@@ -60,7 +60,8 @@ def find_closest_cluster(clusters: dict, sentence: Tensor, threshold: float, bla
 
 
 # try to find clusters for sentences in a cluster that aren't the same cluster
-def re_cluster_sentences(df: DataFrame, clusters: dict, threshold: float, cluster, black_list: set = None) -> defaultdict:
+def re_cluster_sentences(df: DataFrame, clusters: dict, threshold: float, cluster,
+                         black_list: set = None) -> defaultdict:
     remapping = defaultdict(lambda: None)
     for index, row in df[df['id'].isin(clusters[cluster]['sentences'])].iterrows():
         if (closest := find_closest_cluster(clusters,
@@ -223,6 +224,44 @@ def iterate_once(df: DataFrame, clusters: dict, threshold: float, mid_calc: bool
     return False
 
 
+# goes over the entire data set once
+def do_epoch(df: DataFrame,
+             threshold: float,
+             min_size: int,
+             cycles: int = 2,
+             iterations_base: int = 0,
+             iterations_mult: int = 10) -> dict:
+    # initialize the clusters
+    clusters = {}
+    for i in range(cycles):
+        # the smaller the threshold the more erratic the changes will be (at least that's my hypothesis)
+        # therefore it'll take longer to converge, so we'll iterate more times
+        for j in range(iterations_base + round(iterations_mult * (1.0 / threshold))):
+            # randomize the row order
+            df = df.sample(frac=1, random_state=42)
+            df.reset_index(drop=True, inplace=True)
+
+            # do a single iteration of the clustering algorithm
+            if iterate_once(df, clusters, threshold):
+                print("Converged after", j + 1, "iterations!")
+                break
+
+            print("Iteration", j + 1, "done")
+
+        # filter the clusters
+        filter_clusters(df, clusters, min_size)
+
+        # iterate last time to match abandoned sentences to existing clusters
+        iterate_once(df, clusters, threshold, create_centroids=False)
+
+        print("Hyper iteration", i + 1, "done")
+
+    # cannibalize the smaller clusters into the larger ones if possible
+    cannibalize_clusters(df, clusters, threshold, int(min_size))
+
+    return clusters
+
+
 # delete the centroids that are too small
 def filter_clusters(df: DataFrame, clusters: dict, min_size: int):
     # remove the clusters that are too small
@@ -236,6 +275,29 @@ def filter_clusters(df: DataFrame, clusters: dict, min_size: int):
         del clusters[key]
 
 
+# cannibalize the smaller clusters into the larger ones
+def cannibalize_clusters(df: DataFrame, clusters: dict, threshold: float, min_size: int):
+    # initialize the set of keys to delete
+    keys_to_delete = set()
+    for key, value in sorted(clusters.items(), key=lambda item: item[1]['size']):
+        # if the cluster isn't too small, skip it
+        if clusters[key]['size'] > min_size * 2:
+            continue
+
+        # remap the sentences to the new clusters
+        remapping = re_cluster_sentences(df, clusters, threshold, key, keys_to_delete)
+        if (len(remapping) / clusters[key]['size']) > threshold:
+            # if the remapping is successful enough, mark the old cluster for deletion
+            keys_to_delete.add(key)
+            # apply the remapping to the sentences in the cluster
+            for index, row in df[df['cluster'] == key].iterrows():
+                move_sentence(df, clusters, row['id'], remapping[index])
+
+    # delete the clusters that were emptied
+    for key in keys_to_delete:
+        del clusters[key]
+
+
 def analyze_unrecognized_requests(data_file, output_file, min_size):
     # load the model
     model = create_sentence_transformer_model()
@@ -244,8 +306,6 @@ def analyze_unrecognized_requests(data_file, output_file, min_size):
 
     # encode the sentences to the dataframe
     encode_sentences(df, model)
-    # create a dictionary of clusters
-    clusters = {}
 
     # create visualization base
     dims = 3
@@ -253,54 +313,7 @@ def analyze_unrecognized_requests(data_file, output_file, min_size):
 
     # go through the dataframe and match the sentences to the clusters
     threshold = 0.7
-    for i in range(hyper_iterations := 2):
-        # the smaller the threshold the more erratic the changes will be (at least that's my hypothesis)
-        # therefore it'll take longer to converge, so we'll iterate more times
-        for j in range(max_iterations := round(10 * (1.0 / threshold))):
-            # randomize the row order
-            df = df.sample(frac=1, random_state=42)
-            df.reset_index(drop=True, inplace=True)
-
-            # do a single iteration of the clustering algorithm
-            if iterate_once(df, clusters, threshold):
-                print("Converged after", j + 1, "iterations!")
-                break
-
-            print("Iteration", j + 1, "done")
-
-        # filter the clusters
-        filter_clusters(df, clusters, int(min_size))
-
-        # iterate last time to match abandoned sentences to existing clusters
-        iterate_once(df, clusters, threshold, create_centroids=False)
-
-        print("Hyper iteration", i + 1, "done")
-
-    # todo: remove, test only
-    dumpable_clusters = {key: {'sentences': [int(item) for item in value['sentences']]} for key, value in clusters.items()}
-    with open('test/clusters_pre.json', 'w+', encoding='utf8') as dump_file:
-        json.dump(dumpable_clusters, dump_file, indent=4)
-
-    # try to cannibalize the smaller clusters
-    keys_to_delete = set()
-    for key, value in sorted(clusters.items(), key=lambda item: item[1]['size']):
-        if clusters[key]['size'] > int(min_size) * 2:
-            continue
-        remapping = re_cluster_sentences(df, clusters, threshold, key, keys_to_delete)
-        if (len(remapping) / clusters[key]['size']) > threshold:
-            keys_to_delete.add(key)
-
-            for index, row in df[df['cluster'] == key].iterrows():
-                move_sentence(df, clusters, row['id'], remapping[index])
-
-    # delete the clusters that were emptied
-    for key in keys_to_delete:
-        del clusters[key]
-
-    # todo: remove, test only
-    dumpable_clusters = {key: {'sentences': [int(item) for item in value['sentences']]} for key, value in clusters.items()}
-    with open('test/clusters_post.json', 'w+', encoding='utf8') as dump_file:
-        json.dump(dumpable_clusters, dump_file, indent=4)
+    clusters = do_epoch(df, threshold, int(min_size))
 
     # give each cluster a title based on the sentences in the cluster
     title_clusters(df, clusters, int(min_size))
@@ -313,14 +326,6 @@ def analyze_unrecognized_requests(data_file, output_file, min_size):
 
     # todo: remove return statement, meant for testing in jupyter notebook
     return df, clusters
-
-    # todo: implement this function
-    #  you are encouraged to break the functionality into multiple functions,
-    #  but don't split your code into multiple *.py files
-    #
-    #  todo: the final outcome is the json file with clustering results saved as output_file
-
-    pass
 
 
 if __name__ == '__main__':
