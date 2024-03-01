@@ -8,6 +8,7 @@ import pandas as pd
 from matplotlib import pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
+from mpl_toolkits.mplot3d import Axes3D
 from pandas import DataFrame
 from sentence_transformers import SentenceTransformer
 from sklearn.decomposition import PCA
@@ -50,9 +51,10 @@ def find_closest_cluster(clusters: dict, sentence: Tensor, threshold: float):
 
 
 # move a sentence from one centroid to another
-def move_sentence(df: DataFrame, clusters: dict, sentence_index: int, new_cluster):
+def move_sentence(df: DataFrame, clusters: dict, sentence_index, new_cluster):
     # keep the old_cluster
-    old_cluster = df.at[sentence_index, 'centroid']
+    old_cluster = df.at[sentence_index, 'cluster']
+    exists = old_cluster is not None
 
     # move to the new cluster
     df.loc[sentence_index, 'cluster'] = new_cluster
@@ -68,7 +70,10 @@ def move_sentence(df: DataFrame, clusters: dict, sentence_index: int, new_cluste
         cluster_data['size'] -= 1
         # if cluster is empty, delete it
         if cluster_data['size'] == 0:
+            exists = False
             del cluster_data
+
+    return old_cluster, exists
 
 
 # match the sentences to the clusters
@@ -87,39 +92,23 @@ def iterate_over_data(df: DataFrame, clusters: dict, threshold: float, mid_calc:
         encoded = row['encoded']
         cluster = find_closest_cluster(clusters, encoded, threshold)
 
-        if no_cluster:
+        if cluster is None and create_centroids:
             converged = False
-        elif cluster != (row_cent := row['cluster']):
+
+            new_cluster = df['cluster'].max() + 1
+            if np.isnan(new_cluster):
+                new_cluster = 0
+            clusters[new_cluster] = {'centroid': encoded,
+                                     'size': 0,
+                                     'sentences': set()}
+            cluster = new_cluster
+
+        if cluster != row['cluster']:
             converged = False
-            if row_cent:
-                try:
-                    clusters[row_cent]['sentences'].remove(row['id'])
-                    clusters[row_cent]['size'] -= 1
-                    if row_cent == row['id']:
-                        if cluster[row_cent]['size'] == 0:
-                            del clusters[row_cent]
-                        else:
-                            clusters[temp := cluster[row_cent]['sentences'][0]] = clusters[row_cent]
-                            del clusters[row_cent]
-                            row_cent = temp
 
-                    if mid_calc:
-                        calculate_centroids(df, clusters, {row_cent})
-                except KeyError:
-                    print(f"KeyError: {row['id']} not in {row_cent}")
-                    print(f"{clusters[row_cent]['sentences']}")
-
-        if cluster:
-            clusters[cluster]['sentences'].add(row['id'])
-            clusters[cluster]['size'] += 1
-            df.loc[index, 'cluster'] = cluster
+            old_cluster, exists = move_sentence(df, clusters, index, cluster)
             if mid_calc:
-                calculate_centroids(df, clusters, {cluster})
-        elif create_centroids:
-            clusters[row['id']] = {'centroid': encoded,
-                                   'size': 1,
-                                   'sentences': {row['id']}}
-            df.loc[df['id'] == row['id'], 'cluster'] = row['id']
+                calculate_centroids(df, clusters, {old_cluster, cluster} if exists else {cluster})
 
     return converged
 
@@ -131,17 +120,17 @@ def calculate_centroids(df: DataFrame, clusters: dict, keys: set | None = None):
 
 
 # save the clustering results to a json file
-def save_clusters(df: DataFrame, clusters: dict, min_size: int, output_file: str):
+def save_clusters(df: DataFrame, clusters: dict, output_file: str):
     cluster_list = []
     unclustered = []
+    # for each cluster that passed the threshold add it to the final cluster list
     for key, value in clusters.items():
-        if value['size'] >= min_size:
-            cluster_list.append({
-                "cluster_name": value['title'],
-                "requests": df[df['id'].isin(value['sentences'])]['text'].to_list()
-            })
-        else:
-            unclustered.extend(df[df['id'].isin(value['sentences'])]['text'].to_list())
+        cluster_list.append({
+            "cluster_name": value['title'],
+            "requests": df[df['id'].isin(value['sentences'])]['text'].to_list()
+        })
+    # all the clusters that didn't pass should be None, add them to the unclustered category
+    unclustered.extend(df[df['cluster'].isna()]['text'].to_list())
 
     clusters = {"cluster_list": cluster_list, "unclustered": unclustered}
 
@@ -153,11 +142,14 @@ def save_clusters(df: DataFrame, clusters: dict, min_size: int, output_file: str
 def title_clusters(df: DataFrame, clusters: dict, min_size: int):
     for key, value in clusters.items():
         if value['size'] >= min_size:
+            # for each cluster that passed the threshold get all sentences
             sentence_list = df[df['id'].isin(value['sentences'])]['text'].to_list()
+            # analyze the concatenated sentences
             doc = nlp(' '.join('. '.join(sentence_list).split()))
 
             max_sim = float('-inf')
             max_str = ""
+            # find the single-standalone sentence that is the most similar to all the sentences concatenated
             for sent in doc.sents:
                 for constituent in sent._.constituents:
                     if 'S' in constituent._.labels:
@@ -165,7 +157,8 @@ def title_clusters(df: DataFrame, clusters: dict, min_size: int):
                             max_sim = similarity
                             max_str = constituent.text
 
-            value['title'] = max_str
+            # set the most similar as the title
+            value['title'] = max_str.strip('.')
 
 
 # reduces the dimensionality of the data to k dimensions
@@ -179,9 +172,9 @@ def reduce_dimensions(df: DataFrame, dims: int):
 # plots a cluster on a figure
 def plot_cluster(ax: Axes, df: DataFrame, clusters: dict, key: str | None) -> Axes:
     if key:
-        filtered_df = df[df['centroid'] == key]
+        filtered_df = df[df['cluster'] == key]
     elif len(clusters) > 0:
-        filtered_df = df[df['centroid'].isna()]
+        filtered_df = df[df['cluster'].isna()]
     else:
         filtered_df = df
 
@@ -236,7 +229,7 @@ def filter_clusters(df: DataFrame, clusters: dict, min_size: int):
     keys_to_remove = set()
     for key, value in clusters.items():
         if value['size'] < min_size:
-            df.loc[df['centroid'] == key, 'centroid'] = None
+            df.loc[df['cluster'] == key, 'cluster'] = None
             keys_to_remove.add(key)
 
     for key in keys_to_remove:
@@ -258,10 +251,10 @@ def analyze_unrecognized_requests(data_file, output_file, min_size):
     reduce_dimensions(df, dims)
 
     # go through the dataframe and match the sentences to the clusters
-    threshold = 0.91
+    threshold = 0.85
     for i in range(max_iterations := 15):
         # randomize the row order
-        # df = df.sample(frac=1, random_state=42)
+        df = df.sample(frac=1, random_state=42)
 
         # plot the results
         plot_results(df, clusters)
@@ -269,13 +262,17 @@ def analyze_unrecognized_requests(data_file, output_file, min_size):
         # do a single iteration of the clustering algorithm
         if iterate_once(df, clusters, threshold):
             print("Converged after", i + 1, "iterations!")
+
+            # filter the clusters
+            filter_clusters(df, clusters, int(min_size))
+
+            # iterate last time to match abandoned sentences to existing clusters
+            iterate_once(df, clusters, threshold, create_centroids=False)
+
+            # plot the results
+            plot_results(df, clusters)
+
             break
-
-        # filter the clusters
-        filter_clusters(df, clusters, int(min_size))
-
-        # iterate last time to match abandoned sentences to existing clusters
-        iterate_once(df, clusters, threshold, create_centroids=False)
 
         print("Iteration", i + 1, "done")
 
@@ -283,7 +280,7 @@ def analyze_unrecognized_requests(data_file, output_file, min_size):
     title_clusters(df, clusters, int(min_size))
 
     # save the clustering results to a json file
-    save_clusters(df=df, clusters=clusters, min_size=int(min_size), output_file=output_file)
+    save_clusters(df=df, clusters=clusters, output_file=output_file)
 
     # todo: implement this function
     #  you are encouraged to break the functionality into multiple functions,
