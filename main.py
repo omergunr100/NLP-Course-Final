@@ -1,4 +1,6 @@
 import json
+from collections import defaultdict
+from typing import Any
 
 # noinspection PyUnresolvedReferences
 import benepar, spacy
@@ -44,34 +46,50 @@ def encode_sentences(df: DataFrame, model: SentenceTransformer):
 
 
 # find the closest centroid to an encoded sentence
-def find_closest_cluster(clusters: dict, sentence: Tensor, threshold: float):
+def find_closest_cluster(clusters: dict, sentence: Tensor, threshold: float, black_list: set | None = None):
     min_distance = float('inf')
     closest_cluster = None
     for key, value in clusters.items():
+        if black_list and key in black_list:
+            continue
         distance = np.sqrt(np.sum((value['centroid'] - sentence) ** 2))
-        if distance < min_distance and distance < threshold:
+        if distance < min_distance and distance < max(threshold, 1.5 * value['average_distance']):
             min_distance = distance
             closest_cluster = key
     return closest_cluster
 
 
+# try to find clusters for sentences in a cluster that aren't the same cluster
+def re_cluster_sentences(df: DataFrame, clusters: dict, threshold: float, cluster, black_list: set = None) -> defaultdict:
+    remapping = defaultdict(lambda: None)
+    for index, row in df[df['id'].isin(clusters[cluster]['sentences'])].iterrows():
+        if (closest := find_closest_cluster(clusters,
+                                            row['encoded'],
+                                            threshold,
+                                            {cluster} if black_list is None else black_list.union({cluster})
+                                            )) is not None:
+            remapping[index] = closest
+
+    return remapping
+
+
 # move a sentence from one centroid to another
-def move_sentence(df: DataFrame, clusters: dict, sentence_index, new_cluster):
+def move_sentence(df: DataFrame, clusters: dict, sent_id, new_cluster):
     # keep the old_cluster
-    old_cluster = df.at[sentence_index, 'cluster']
+    old_cluster = df[df['id'] == sent_id]['cluster'].iat[0]
     exists = old_cluster is not None
 
     # move to the new cluster
-    df.loc[sentence_index, 'cluster'] = new_cluster
+    df.loc[df['id'] == sent_id, 'cluster'] = new_cluster
     if new_cluster is not None:
         cluster_data = clusters[new_cluster]
-        cluster_data['sentences'].add(df.at[sentence_index, 'id'])
+        cluster_data['sentences'].add(sent_id)
         cluster_data['size'] += 1
 
     # remove from old cluster
     if old_cluster is not None:
         cluster_data = clusters[old_cluster]
-        cluster_data['sentences'].remove(df.at[sentence_index, 'id'])
+        cluster_data['sentences'].remove(sent_id)
         cluster_data['size'] -= 1
         # if cluster is empty, delete it
         if cluster_data['size'] == 0:
@@ -105,13 +123,14 @@ def iterate_over_data(df: DataFrame, clusters: dict, threshold: float, mid_calc:
                 new_cluster = 0
             clusters[new_cluster] = {'centroid': encoded,
                                      'size': 0,
-                                     'sentences': set()}
+                                     'sentences': set(),
+                                     'average_distance': 0.0}
             cluster = new_cluster
 
         if cluster != row['cluster']:
             converged = False
 
-            old_cluster, exists = move_sentence(df, clusters, index, cluster)
+            old_cluster, exists = move_sentence(df, clusters, row['id'], cluster)
             if mid_calc:
                 calculate_centroids(df, clusters, {old_cluster, cluster} if exists else {cluster})
 
@@ -121,7 +140,9 @@ def iterate_over_data(df: DataFrame, clusters: dict, threshold: float, mid_calc:
 # calculate the centroids of the clusters for specific keys
 def calculate_centroids(df: DataFrame, clusters: dict, keys: set | None = None):
     for key in (keys if keys else clusters.keys()):
-        clusters[key]['centroid'] = np.mean(df[df['cluster'] == key]['encoded'].to_numpy())
+        clusters[key]['centroid'] = np.mean(df[df['cluster'] == key]['encoded'])
+        clusters[key]['average_distance'] = np.mean(df.loc[df['cluster'] == key, 'encoded'].map(
+            lambda x: np.sqrt(np.sum((x - clusters[key]['centroid']) ** 2))))
 
 
 # save the clustering results to a json file
@@ -220,7 +241,7 @@ def analyze_unrecognized_requests(data_file, output_file, min_size):
     model = create_sentence_transformer_model()
     # create dataframe of the data
     df = read_lines(data_file)
-    df.reset_index(inplace=True)
+
     # encode the sentences to the dataframe
     encode_sentences(df, model)
     # create a dictionary of clusters
@@ -231,11 +252,14 @@ def analyze_unrecognized_requests(data_file, output_file, min_size):
     reduce_dimensions(df, dims)
 
     # go through the dataframe and match the sentences to the clusters
-    threshold = 0.80
+    threshold = 0.7
     for i in range(hyper_iterations := 2):
-        for j in range(max_iterations := 12):
+        # the smaller the threshold the more erratic the changes will be (at least that's my hypothesis)
+        # therefore it'll take longer to converge, so we'll iterate more times
+        for j in range(max_iterations := round(10 * (1.0 / threshold))):
             # randomize the row order
             df = df.sample(frac=1, random_state=42)
+            df.reset_index(drop=True, inplace=True)
 
             # do a single iteration of the clustering algorithm
             if iterate_once(df, clusters, threshold):
@@ -252,6 +276,32 @@ def analyze_unrecognized_requests(data_file, output_file, min_size):
 
         print("Hyper iteration", i + 1, "done")
 
+    # todo: remove, test only
+    dumpable_clusters = {key: {'sentences': [int(item) for item in value['sentences']]} for key, value in clusters.items()}
+    with open('test/clusters_pre.json', 'w+', encoding='utf8') as dump_file:
+        json.dump(dumpable_clusters, dump_file, indent=4)
+
+    # try to cannibalize the smaller clusters
+    keys_to_delete = set()
+    for key, value in sorted(clusters.items(), key=lambda item: item[1]['size']):
+        if clusters[key]['size'] > int(min_size) * 2:
+            continue
+        remapping = re_cluster_sentences(df, clusters, threshold, key, keys_to_delete)
+        if (len(remapping) / clusters[key]['size']) > threshold:
+            keys_to_delete.add(key)
+
+            for index, row in df[df['cluster'] == key].iterrows():
+                move_sentence(df, clusters, row['id'], remapping[index])
+
+    # delete the clusters that were emptied
+    for key in keys_to_delete:
+        del clusters[key]
+
+    # todo: remove, test only
+    dumpable_clusters = {key: {'sentences': [int(item) for item in value['sentences']]} for key, value in clusters.items()}
+    with open('test/clusters_post.json', 'w+', encoding='utf8') as dump_file:
+        json.dump(dumpable_clusters, dump_file, indent=4)
+
     # give each cluster a title based on the sentences in the cluster
     title_clusters(df, clusters, int(min_size))
 
@@ -261,7 +311,8 @@ def analyze_unrecognized_requests(data_file, output_file, min_size):
     # plot the results
     plot_results(df, color='title')
 
-    return df
+    # todo: remove return statement, meant for testing in jupyter notebook
+    return df, clusters
 
     # todo: implement this function
     #  you are encouraged to break the functionality into multiple functions,
