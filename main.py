@@ -1,6 +1,5 @@
 import json
 from collections import defaultdict
-from typing import Any, Dict
 
 # noinspection PyUnresolvedReferences
 import benepar, spacy
@@ -53,7 +52,7 @@ def find_closest_cluster(clusters: dict, sentence: Tensor, threshold: float, bla
         if black_list and key in black_list:
             continue
         distance = np.sqrt(np.sum((value['centroid'] - sentence) ** 2))
-        if distance < min_distance and distance < max(threshold, 1.5 * value['average_distance']):
+        if distance < min_distance and distance < threshold:  # max(threshold, 1.5 * value['average_distance'])
             min_distance = distance
             closest_cluster = key
     return closest_cluster
@@ -225,13 +224,16 @@ def iterate_once(df: DataFrame, clusters: dict, threshold: float, mid_calc: bool
 
 
 # goes over the entire data set once
-def do_epoch(df: DataFrame,
+def do_epoch(input_data: str,
+             sentence_transformer_model: SentenceTransformer,
              threshold: float,
              min_size: int,
              cycles: int = 2,
              iterations_base: int = 0,
-             iterations_mult: int = 10) -> dict:
-    # initialize the clusters
+             iterations_mult: int = 10) -> tuple[DataFrame, dict]:
+    # initialize the dataframe and clusters
+    df = read_lines(input_data)
+    encode_sentences(df, sentence_transformer_model)
     clusters = {}
     for i in range(cycles):
         # the smaller the threshold the more erratic the changes will be (at least that's my hypothesis)
@@ -259,7 +261,7 @@ def do_epoch(df: DataFrame,
     # cannibalize the smaller clusters into the larger ones if possible
     cannibalize_clusters(df, clusters, threshold, int(min_size))
 
-    return clusters
+    return df, clusters
 
 
 # delete the centroids that are too small
@@ -301,19 +303,13 @@ def cannibalize_clusters(df: DataFrame, clusters: dict, threshold: float, min_si
 def analyze_unrecognized_requests(data_file, output_file, min_size):
     # load the model
     model = create_sentence_transformer_model()
-    # create dataframe of the data
-    df = read_lines(data_file)
 
-    # encode the sentences to the dataframe
-    encode_sentences(df, model)
+    # go through the dataframe and match the sentences to the clusters
+    df, clusters = do_epoch(data_file, model, threshold=0.7, min_size=int(min_size))
 
     # create visualization base
     dims = 3
     reduce_dimensions(df, dims)
-
-    # go through the dataframe and match the sentences to the clusters
-    threshold = 0.7
-    clusters = do_epoch(df, threshold, int(min_size))
 
     # give each cluster a title based on the sentences in the cluster
     title_clusters(df, clusters, int(min_size))
