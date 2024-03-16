@@ -1,4 +1,5 @@
 import json
+import string
 from collections import defaultdict
 
 # noinspection PyUnresolvedReferences
@@ -47,7 +48,7 @@ def encode_sentences(df: DataFrame, model: SentenceTransformer):
 # find the closest centroid to an encoded sentence
 def find_closest_cluster(clusters: dict, sentence: Tensor, threshold: float, black_list: set | None = None):
     min_distance = float('inf')
-    closest_cluster = None
+    closest_cluster = -1
     for key, value in clusters.items():
         if black_list and key in black_list:
             continue
@@ -77,17 +78,17 @@ def re_cluster_sentences(df: DataFrame, clusters: dict, threshold: float, cluste
 def move_sentence(df: DataFrame, clusters: dict, sent_id, new_cluster):
     # keep the old_cluster
     old_cluster = df[df['id'] == sent_id]['cluster'].iat[0]
-    exists = old_cluster is not None
+    exists = old_cluster != -1
 
     # move to the new cluster
     df.loc[df['id'] == sent_id, 'cluster'] = new_cluster
-    if new_cluster is not None:
+    if new_cluster != -1:
         cluster_data = clusters[new_cluster]
         cluster_data['sentences'].add(sent_id)
         cluster_data['size'] += 1
 
     # remove from old cluster
-    if old_cluster is not None:
+    if old_cluster != -1:
         cluster_data = clusters[old_cluster]
         cluster_data['sentences'].remove(sent_id)
         cluster_data['size'] -= 1
@@ -107,7 +108,7 @@ def iterate_over_data(df: DataFrame, clusters: dict, threshold: float, mid_calc:
     # check if the dataframe has a cluster column
     no_cluster = 'cluster' not in df
     if no_cluster:
-        df['cluster'] = None
+        df['cluster'] = -1
 
     # iterate over the rows of the dataframe
     for index, row in df.iterrows():
@@ -140,9 +141,9 @@ def iterate_over_data(df: DataFrame, clusters: dict, threshold: float, mid_calc:
 # calculate the centroids of the clusters for specific keys
 def calculate_centroids(df: DataFrame, clusters: dict, keys: set | None = None):
     for key in (keys if keys else clusters.keys()):
-        clusters[key]['centroid'] = np.mean(df[df['cluster'] == key]['encoded'])
-        clusters[key]['average_distance'] = np.mean(df.loc[df['cluster'] == key, 'encoded'].map(
-            lambda x: np.sqrt(np.sum((x - clusters[key]['centroid']) ** 2))))
+        clusters[key]['centroid'] = df[df['cluster'] == key]['encoded'].mean()
+        clusters[key]['average_distance'] = np.mean(df.loc[df['cluster'] == key, 'encoded']
+                                                    .map(lambda x: np.linalg.norm(x - clusters[key]['centroid'])))
 
 
 # save the clustering results to a json file
@@ -164,7 +165,42 @@ def save_clusters(df: DataFrame, clusters: dict, output_file: str):
         json.dump(clusters, fout, indent=4)
 
 
-# give a title to each cluster
+# give a title to a cluster
+def title_clusters_dataframe(df: DataFrame):
+    df['title'] = 'cluster_' + df['cluster'].astype(str)
+    for cluster in df['cluster'].unique():
+        if cluster == -1:
+            df.loc[df['cluster'] == cluster, 'title'] = 'unclustered'
+            continue
+
+        # get all sentences in the cluster to a list
+        sentence_list = df.loc[df['cluster'] == cluster, 'text'].to_list()
+        # strip the sentences of any extra spaces (anywhere) and periods (at the end)
+        sentence_list = [' '.join(sentence.split()).strip('.') for sentence in sentence_list]
+        # concatenate the sentences and make sure that they end with punctuation
+        paragraph = ' '.join([sentence if sentence.endswith(string.punctuation) else sentence + '.'
+                              for sentence in sentence_list])
+        # analyze the concatenated sentences (the entire cluster)
+        doc = nlp(paragraph)
+
+        # initialize the max similarity and the max string
+        max_sim = float('-inf')
+        max_str = ""
+
+        # find the single-standalone sentence that is the most similar to all the sentences concatenated
+        for sent in doc.sents:
+            for constituent in sent._.constituents:
+                if 'S' in constituent._.labels:
+                    if (similarity := doc.similarity(constituent)) > max_sim:
+                        max_sim = similarity
+                        max_str = constituent.text
+
+        # set the most similar as the title
+        title = max_str.strip('.')
+        if title != '':
+            df.loc[df['cluster'] == cluster, 'title'] = title
+
+
 def title_clusters(df: DataFrame, clusters: dict, min_size: int):
     for key, value in clusters.items():
         if value['size'] >= min_size:
@@ -185,6 +221,8 @@ def title_clusters(df: DataFrame, clusters: dict, min_size: int):
 
             # set the most similar as the title
             value['title'] = max_str.strip('.')
+            if value['title'] == '':
+                value['title'] = f'{key}'
             df.loc[df['cluster'] == key, 'title'] = value['title']
 
     df.loc[df['cluster'].isna(), 'title'] = 'unclustered'
@@ -270,7 +308,7 @@ def filter_clusters(df: DataFrame, clusters: dict, min_size: int):
     keys_to_remove = set()
     for key, value in clusters.items():
         if value['size'] < min_size:
-            df.loc[df['cluster'] == key, 'cluster'] = None
+            df.loc[df['cluster'] == key, 'cluster'] = -1
             keys_to_remove.add(key)
 
     for key in keys_to_remove:
@@ -300,28 +338,123 @@ def cannibalize_clusters(df: DataFrame, clusters: dict, threshold: float, min_si
         del clusters[key]
 
 
+def dbscan_clustering(input_data: str,
+                      sentence_transformer_model: SentenceTransformer,
+                      min_size: int) -> DataFrame:
+    def find_closest_neighbors(df: DataFrame):
+        df['closest_to_number'] = 0
+        for index, row in df.iterrows():
+            min_distance = float('inf')
+            min_index = -1
+            for index2, row2 in df.iterrows():
+                if index == index2:
+                    continue
+                if (distance := np.linalg.norm(row['encoded'] - row2['encoded'])) < min_distance:
+                    min_distance = distance
+                    min_index = index2
+            df.at[index, 'closest_neighbor_index'] = min_index
+            df.at[index, 'closest_neighbor_distance'] = min_distance
+            df.at[min_index, 'closest_to_number'] += 1
+
+    def count_within_range(df: DataFrame, eps: float):
+        df['within_range'] = 0
+        for index, row in df.iterrows():
+            for index2, row2 in df[df.index > index].iterrows():
+                if np.linalg.norm(row['encoded'] - row2['encoded']) < eps:
+                    df.at[index, 'within_range'] += 1
+                    df.at[index2, 'within_range'] += 1
+
+    def find_neighbors(df: DataFrame, index: int, eps: float) -> set[int]:
+        neighbors = set()
+        for i in range(len(df)):
+            if i == index:
+                continue
+            if np.linalg.norm(df.at[index, 'encoded'] - df.at[i, 'encoded']) < eps:
+                neighbors.add(i)
+        return neighbors
+
+    def try_add_to_cluster(df: DataFrame, index: int, cluster_id: int, eps: float) -> int:
+        if df.at[index, 'visited']:
+            return 0
+        df.at[index, 'visited'] = True
+        df.at[index, 'cluster'] = cluster_id
+        neighbors = find_neighbors(df, index, eps)
+        return sum(try_add_to_cluster(df,
+                                      neighbor,
+                                      cluster_id,
+                                      eps - np.linalg.norm(df.at[index, 'encoded'] - df.at[neighbor, 'encoded']) / 1.5
+                                      ) for neighbor in neighbors) + 1
+
+    # initialize the dataframe and clusters
+    df = read_lines(input_data)
+    df['visited'] = False
+    df['cluster'] = -1
+    df['cluster'] = df['cluster'].astype(int)
+    encode_sentences(df, sentence_transformer_model)
+    df = df.sample(frac=1)
+    find_closest_neighbors(df)
+    count_within_range(df, df['closest_neighbor_distance'].quantile(0.95))
+    df.sort_values(by='within_range', inplace=True, ascending=False, ignore_index=True)
+    df.reset_index(drop=True, inplace=True)
+
+    cluster_id = 0
+    for index in range(len(df)):
+        if df.at[index, 'visited']:
+            continue
+        if try_add_to_cluster(df, index, cluster_id, df['closest_neighbor_distance'].quantile(0.95)) + 1 > min_size:
+            cluster_id += 1
+        else:
+            df.loc[df['cluster'] == cluster_id, 'visited'] = False
+            df.loc[df['cluster'] == cluster_id, 'cluster'] = -1
+
+    return df
+
+
+def dbscan_to_json(df: DataFrame, output_file: str) -> dict:
+    # create the cluster list and the unclustered list
+    cluster_list = []
+    unclustered = []
+    # give each cluster a title based on the sentences in the cluster
+    title_clusters_dataframe(df)
+
+    for cluster_id in df['cluster'].unique():
+        if cluster_id == -1:
+            unclustered.extend(df[df['cluster'] == cluster_id]['text'].to_list())
+        else:
+            cluster_list.append({
+                "cluster_name": f"{df.loc[df['cluster'] == cluster_id, 'title'].iloc[0]}",
+                "requests": df[df['cluster'] == cluster_id]['text'].to_list()
+            })
+
+    results = {"cluster_list": cluster_list, "unclustered": unclustered}
+
+    with open(output_file, 'w+', encoding='utf8') as fout:
+        json.dump(results, fout, indent=4)
+
+    return results
+
+
 def analyze_unrecognized_requests(data_file, output_file, min_size):
     # load the model
     model = create_sentence_transformer_model()
 
     # go through the dataframe and match the sentences to the clusters
-    df, clusters = do_epoch(data_file, model, threshold=0.7, min_size=int(min_size))
+    # df, clusters = do_epoch(data_file, model, threshold=0.7, min_size=int(min_size))
+    df = dbscan_clustering(data_file, model, int(min_size))
 
     # create visualization base
     dims = 3
     reduce_dimensions(df, dims)
 
     # give each cluster a title based on the sentences in the cluster
-    title_clusters(df, clusters, int(min_size))
+    # title_clusters(df, clusters, int(min_size))
 
     # save the clustering results to a json file
-    save_clusters(df=df, clusters=clusters, output_file=output_file)
+    # save_clusters(df=df, clusters=clusters, output_file=output_file)
+    dbscan_to_json(df, output_file)
 
     # plot the results
     plot_results(df, color='title')
-
-    # todo: remove return statement, meant for testing in jupyter notebook
-    return df, clusters
 
 
 if __name__ == '__main__':
