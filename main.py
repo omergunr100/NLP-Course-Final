@@ -12,7 +12,6 @@ from matplotlib.figure import Figure
 from pandas import DataFrame
 from sentence_transformers import SentenceTransformer
 from sklearn.decomposition import PCA
-from torch import Tensor
 
 from compare_clustering_solutions import evaluate_clustering
 
@@ -105,11 +104,8 @@ def plot_results(df: DataFrame,
 def init_dataframe(data_file: str, model: SentenceTransformer) -> DataFrame:
     df = read_lines(data_file)
     df['visited'] = False
-    df['visited'] = df['visited'].astype(bool)
     df['cluster'] = -1
-    df['cluster'] = df['cluster'].astype(int)
     df['radius'] = 0.0
-    df['radius'] = df['radius'].astype(float)
     encode_sentences(df, model)
     find_closest_neighbors(df)
     return df
@@ -194,21 +190,24 @@ def try_add_to_cluster(df: DataFrame, index: int, cluster_id: int, eps: float) -
 
 # my implementation of the DBSCAN clustering algorithm
 def dbscan_clustering(df: DataFrame,
-                      min_size: int,
-                      quantile: float = 0.95):
+                      quantile: float = 0.95) -> DataFrame:
     # shuffle the dataframe
     df = df.sample(frac=1)
     count_within_range(df, df['closest_neighbor_distance'].quantile(quantile))
     df.sort_values(by='within_range', inplace=True, ascending=False, ignore_index=True)
     df.reset_index(drop=True, inplace=True)
 
+    eps = df['closest_neighbor_distance'].quantile(quantile)
     cluster_id = df['cluster'].max() + 1
     for index in range(len(df)):
         if df.at[index, 'visited']:
             continue
 
-        try_add_to_cluster(df, index, cluster_id, df['closest_neighbor_distance'].quantile(quantile))
+        print(f"Starting cluster {cluster_id} with \'{df.at[index, 'text']}\'")
+        print(f"Added {try_add_to_cluster(df, index, cluster_id, eps)} sentences to cluster {cluster_id}")
         cluster_id += 1
+
+    return df
 
 
 # reverse cluster sentences to existing clusters
@@ -221,12 +220,15 @@ def reverse_cluster(df: DataFrame) -> bool:
         df2 = df[df['cluster'] != -1]
         df2['distance'] = df2['encoded'].map(lambda x: np.linalg.norm(row['encoded'] - x))
         df2.sort_values(by='distance', inplace=True, ascending=True)
+        df2.reindex()
         df2 = df2[df2['distance'] < df2['radius']]
         if len(df2) > 0:
             converged = False
-            df.at[index, 'cluster'] = df2.at[0, 'cluster']
+            index2 = df2.index[0]
+            df.at[index, 'cluster'] = df2.at[index2, 'cluster']
             df.at[index, 'visited'] = True
-            df.at[index, 'radius'] = df2.at[0, 'radius'] - df2.at[0, 'distance']
+            df.at[index, 'radius'] = df2.at[index2, 'radius'] - df2.at[index2, 'distance']
+
     return converged
 
 
@@ -243,7 +245,7 @@ def dataframe_to_json(df: DataFrame, output_file: str) -> dict:
             unclustered.extend(df[df['cluster'] == cluster_id]['text'].to_list())
         else:
             cluster_list.append({
-                "cluster_name": f"{df.loc[df['cluster'] == cluster_id, 'title'].iloc[0]}",
+                "cluster_name": f"{df.loc[df['cluster'] == cluster_id, 'title'].iat[0]}",
                 "requests": df[df['cluster'] == cluster_id]['text'].to_list()
             })
 
@@ -263,7 +265,7 @@ def analyze_unrecognized_requests(data_file, output_file, min_size):
     df = init_dataframe(data_file, model)
 
     # go through the dataframe and match the sentences to the clusters
-    dbscan_clustering(df, int(min_size), 0.9)
+    df = dbscan_clustering(df, 0.9)
 
     # try to match remaining sentences to existing clusters
     max_iter = 12
