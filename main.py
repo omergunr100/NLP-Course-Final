@@ -97,11 +97,19 @@ def reduce_dimensions(df: DataFrame, dims: int):
 
 # plot results - plotly
 def plot_results(df: DataFrame,
+                 title: str = 'Clustering Results',
                  axis: tuple[str, str, str] | None = ('reduced0', 'reduced1', 'reduced2'),
                  color: str = 'cluster') -> Figure:
     x, y, z = axis
     fig = px.scatter_3d(df, x=x, y=y, z=z,
-                        hover_data=['text'],
+                        title=title,
+                        hover_data={
+                            'text': True,
+                            'title': True,
+                            x: True,
+                            y: True,
+                            z: True
+                        },
                         size_max=1.5,
                         color=color if color in df else None)
     fig.show()
