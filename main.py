@@ -182,6 +182,7 @@ def dbscan_clustering(df: DataFrame,
                       min_size: int,
                       sort: bool = True,
                       prioritize_unclustered: bool = True,
+                      prioritize_existing_clusters: bool = False,
                       count_unclustered_only: bool = True,
                       create_clusters: bool = True) -> DataFrame:
     # shuffle the dataframe
@@ -200,9 +201,11 @@ def dbscan_clustering(df: DataFrame,
 
     # go through the dataframe and cluster the sentences
     eps = df['closest_neighbor_distance'].quantile(quantile)
-    for i in range(2):
+    for i in range(3):
         # if prioritize_unclustered is False, skip the first iteration (meant to prioritize the unclustered sentences)
         if i == 0 and not prioritize_unclustered:
+            continue
+        if i == 1 and not prioritize_existing_clusters:
             continue
 
         for index in range(len(df)):
@@ -210,7 +213,8 @@ def dbscan_clustering(df: DataFrame,
 
             if (df.at[index, 'visited'] or
                     df.at[index, 'tried_to_cluster'] or
-                    (i == 0 and prioritize_unclustered and df.at[index, 'cluster'] != -1)):
+                    (i == 0 and prioritize_unclustered and df.at[index, 'cluster'] != -1) or
+                    (i == 1 and prioritize_existing_clusters and df.at[index, 'cluster'] == -1)):
                 continue
             elif (t_cluster_id := df.at[index, 'cluster']) != -1:
                 cluster_id = t_cluster_id
@@ -258,9 +262,6 @@ def linear_interpolation(min_val: float, max_val: float, steps: int, step: int) 
 
 
 def analyze_unrecognized_requests(data_file, output_file, min_size):
-    # todo: remove timing code
-    start_time = time.time()
-
     # prepare the spacy pipeline for the naming part of the task
     pool = ThreadPool(processes=1)
     nlp_async = pool.apply_async(prepare_spacy_pipeline)
@@ -272,14 +273,17 @@ def analyze_unrecognized_requests(data_file, output_file, min_size):
     df = init_dataframe(data_file, model)
 
     # initialize the clustering parameters
-    max_iter_new_clusters = 3
-    max_iter_existing_clusters = 3
+    max_iter_new_clusters = 2
+    max_iter_existing_clusters = 2
     curr_iter = 0
-    min_quantile = 0.55
-    max_quantile_new_clusters = 0.75
-    max_quantile = 0.95
+    min_quantile = 0.6  # 0.55
+    max_quantile_new_clusters = 0.7
+    max_quantile = 0.9
 
-    # try to match remaining sentences to existing clusters
+    # todo: remove timing code
+    start_time = time.time()
+
+    # try to cluster the sentences
     while curr_iter < max_iter_new_clusters:
         curr_quantile = linear_interpolation(min_val=min_quantile,
                                              max_val=max_quantile_new_clusters,
@@ -287,15 +291,20 @@ def analyze_unrecognized_requests(data_file, output_file, min_size):
                                              step=curr_iter)
         print(f"Starting to cluster the unclustered sentences using the {round(curr_quantile, 2)} quantile as radius.")
 
-        df = dbscan_clustering(df, quantile=curr_quantile, min_size=int(min_size))
-        print(f"Found {df['cluster'].nunique() - 1} clusters.")
-        print(f"{df[df['cluster'] != -1]['text'].count()} clustered and "
+        df = dbscan_clustering(df, quantile=curr_quantile, min_size=int(min_size),
+                               prioritize_unclustered=True,
+                               prioritize_existing_clusters=False,
+                               create_clusters=True)
+        print(f"Found {df['cluster'].nunique() - 1} clusters.\n"
+              f"{df[df['cluster'] != -1]['text'].count()} clustered and "
               f"{df[df['cluster'] == -1]['text'].count()} unclustered sentences.")
 
         curr_iter += 1
         print(f"iteration {curr_iter} complete.\n")
 
-    print("Now trying to match the remaining sentences to existing clusters.\n")
+    print("Now prioritizing matching to existing clusters rather than creating new ones.\n")
+
+    # try to match the remaining sentences to existing clusters
     while curr_iter < max_iter_new_clusters + max_iter_existing_clusters:
         curr_quantile = linear_interpolation(min_val=max_quantile_new_clusters,
                                              max_val=max_quantile,
@@ -304,8 +313,11 @@ def analyze_unrecognized_requests(data_file, output_file, min_size):
         print(f"Starting to cluster the unclustered sentences using the {round(curr_quantile, 2)} quantile as radius.")
 
         df = dbscan_clustering(df, quantile=curr_quantile, min_size=int(min_size),
-                               prioritize_unclustered=False, create_clusters=False)
-        print(f"{df[df['cluster'] != -1]['text'].count()} clustered and "
+                               prioritize_unclustered=False,
+                               prioritize_existing_clusters=True,
+                               create_clusters=True)
+        print(f"Found {df['cluster'].nunique() - 1} clusters.\n"
+              f"{df[df['cluster'] != -1]['text'].count()} clustered and "
               f"{df[df['cluster'] == -1]['text'].count()} unclustered sentences.")
 
         curr_iter += 1
