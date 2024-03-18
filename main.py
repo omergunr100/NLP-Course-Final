@@ -1,6 +1,7 @@
 import json
 import string
 import time
+from multiprocessing.pool import ThreadPool
 
 # noinspection PyUnresolvedReferences
 import benepar, spacy
@@ -12,14 +13,20 @@ from matplotlib.figure import Figure
 from pandas import DataFrame
 from sentence_transformers import SentenceTransformer
 from sklearn.decomposition import PCA
+from spacy import Language
 
 from compare_clustering_solutions import evaluate_clustering
 
-# load the spaCy model
-benepar.download('benepar_en3')
-nlp = en_core_web_md.load()
-# load the benepar parser
-nlp.add_pipe("benepar", config={"model": "benepar_en3"})
+
+# prepare the spacy pipeline for the naming part of the task
+def prepare_spacy_pipeline() -> Language:
+    # load the spaCy model
+    benepar.download('benepar_en3')
+    nlp = en_core_web_md.load()
+    # load the benepar parser
+    nlp.add_pipe("benepar", config={"model": "benepar_en3"})
+
+    return nlp
 
 
 # clean the query text for processing
@@ -45,7 +52,7 @@ def encode_sentences(df: DataFrame, model: SentenceTransformer):
 
 
 # give a title to a cluster
-def title_clusters_dataframe(df: DataFrame):
+def title_clusters_dataframe(df: DataFrame, nlp: Language):
     df['title'] = 'cluster_' + df['cluster'].astype(str)
     for cluster in df['cluster'].unique():
         if cluster == -1:
@@ -104,9 +111,7 @@ def plot_results(df: DataFrame,
 # read the data and initialize the dataframe
 def init_dataframe(data_file: str, model: SentenceTransformer) -> DataFrame:
     df = read_lines(data_file)
-    df['visited'] = False
     df['cluster'] = -1
-    df['radius'] = 0.0
     encode_sentences(df, model)
     find_closest_neighbors(df)
     return df
@@ -160,11 +165,9 @@ def try_add_to_cluster(df: DataFrame, index: int, cluster_id: int, eps: float) -
 
     df.at[index, 'visited'] = True
     df.at[index, 'cluster'] = cluster_id
-    df.at[index, 'radius'] = eps
+    df.at[index, 'tried_to_cluster'] = True
 
     neighbors = find_neighbors(df, index, eps)
-    for neighbor in neighbors:
-        df.at[neighbor, 'cluster'] = cluster_id
 
     return sum(try_add_to_cluster(df,
                                   neighbor,
@@ -175,17 +178,21 @@ def try_add_to_cluster(df: DataFrame, index: int, cluster_id: int, eps: float) -
 
 # my implementation of the DBSCAN clustering algorithm
 def dbscan_clustering(df: DataFrame,
-                      quantile: float = 0.5,
-                      min_size: int = 10,
+                      quantile: float,
+                      min_size: int,
                       sort: bool = True,
                       prioritize_unclustered: bool = True,
+                      count_unclustered_only: bool = True,
                       create_clusters: bool = True) -> DataFrame:
     # shuffle the dataframe
     df = df.sample(frac=1)
+    df['tried_to_cluster'] = False
+    df['visited'] = False
 
     # count the number of sentences within a certain range of each sentence
-    count_within_range(df, df['closest_neighbor_distance'].quantile(quantile), prioritize_unclustered)
+    count_within_range(df, df['closest_neighbor_distance'].quantile(quantile), count_unclustered_only)
     print(f"Max number of sentences within range: {df['within_range'].max()}")
+    print(f"Max number within range for clustered: {df[df['cluster'] != -1]['within_range'].max()}")
 
     if sort:
         df.sort_values(by='within_range', inplace=True, ascending=False, ignore_index=True)
@@ -201,7 +208,9 @@ def dbscan_clustering(df: DataFrame,
         for index in range(len(df)):
             new_cluster = False
 
-            if df.at[index, 'visited'] or (i == 0 and prioritize_unclustered and df.at[index, 'cluster'] != -1):
+            if (df.at[index, 'visited'] or
+                    df.at[index, 'tried_to_cluster'] or
+                    (i == 0 and prioritize_unclustered and df.at[index, 'cluster'] != -1)):
                 continue
             elif (t_cluster_id := df.at[index, 'cluster']) != -1:
                 cluster_id = t_cluster_id
@@ -211,39 +220,13 @@ def dbscan_clustering(df: DataFrame,
                 cluster_id = df['cluster'].max() + 1
                 new_cluster = True
 
-            if new_cluster and try_add_to_cluster(df, index, cluster_id, eps) < min_size:
-                df.loc[df['cluster'] == cluster_id, ['cluster', 'visited', 'radius']] = [-1, False, 0.0]
+            cluster_size = try_add_to_cluster(df, index, cluster_id, eps)
+            if new_cluster and cluster_size < min_size:
+                df.loc[df['cluster'] == cluster_id, 'cluster'] = -1
+                df.loc[df['cluster'] == cluster_id, 'visited'] = False
 
+    df.drop(columns=['tried_to_cluster'], inplace=True)
     return df
-
-
-# reverse cluster sentences to existing clusters
-def reverse_cluster(df: DataFrame) -> bool:
-    converged: bool = True
-
-    for i in range(len(df)):
-        index = df.index[i]
-        if df.at[index, 'cluster'] != -1:
-            continue
-        clustered_view = df[df['cluster'] != -1]
-        df_distance = pd.DataFrame()
-        df_distance['original_index'] = clustered_view.index
-        df_distance['encoded'] = clustered_view['encoded']
-        df_distance['distance'] = clustered_view['encoded'].map(lambda x: np.linalg.norm(df.at[index, 'encoded'] - x))
-        df_distance['radius'] = clustered_view['radius']
-        df_distance['cluster'] = clustered_view['cluster']
-        df_distance = df_distance[df_distance['distance'] < df_distance['radius']]
-        df_distance.sort_values(by='distance', inplace=True, ascending=True)
-        df_distance.reset_index(drop=True, inplace=True)
-
-        if len(df_distance) > 0:
-            converged = False
-            i_distance = df_distance.index[0]
-            df.at[index, 'cluster'] = df_distance.at[i_distance, 'cluster']
-            df.at[index, 'visited'] = True
-            df.at[index, 'radius'] = df_distance.at[i_distance, 'radius'] - df_distance.at[i_distance, 'distance']
-
-    return converged
 
 
 # save the clustering results to a json file
@@ -251,8 +234,6 @@ def dataframe_to_json(df: DataFrame, output_file: str) -> dict:
     # create the cluster list and the unclustered list
     cluster_list = []
     unclustered = []
-    # give each cluster a title based on the sentences in the cluster
-    title_clusters_dataframe(df)
 
     for cluster_id in df['cluster'].unique():
         if cluster_id == -1:
@@ -271,9 +252,18 @@ def dataframe_to_json(df: DataFrame, output_file: str) -> dict:
     return results
 
 
+# linear interpolation between 2 values
+def linear_interpolation(min_val: float, max_val: float, steps: int, step: int) -> float:
+    return min_val + (((max_val - min_val) / steps) * step)
+
+
 def analyze_unrecognized_requests(data_file, output_file, min_size):
     # todo: remove timing code
     start_time = time.time()
+
+    # prepare the spacy pipeline for the naming part of the task
+    pool = ThreadPool(processes=1)
+    nlp_async = pool.apply_async(prepare_spacy_pipeline)
 
     # load the model
     model = create_sentence_transformer_model()
@@ -282,19 +272,39 @@ def analyze_unrecognized_requests(data_file, output_file, min_size):
     df = init_dataframe(data_file, model)
 
     # initialize the clustering parameters
-    max_iter = 3
+    max_iter_new_clusters = 3
+    max_iter_existing_clusters = 3
     curr_iter = 0
     min_quantile = 0.55
-    max_quantile = 0.75
+    max_quantile_new_clusters = 0.75
+    max_quantile = 0.95
 
     # try to match remaining sentences to existing clusters
-    num_filtered = 1
-    while curr_iter < max_iter and num_filtered > 0:
-        curr_quantile = ((max_quantile - min_quantile) / (max_iter - 1)) * curr_iter + min_quantile
+    while curr_iter < max_iter_new_clusters:
+        curr_quantile = linear_interpolation(min_val=min_quantile,
+                                             max_val=max_quantile_new_clusters,
+                                             steps=max_iter_new_clusters - 1,
+                                             step=curr_iter)
         print(f"Starting to cluster the unclustered sentences using the {round(curr_quantile, 2)} quantile as radius.")
 
         df = dbscan_clustering(df, quantile=curr_quantile, min_size=int(min_size))
         print(f"Found {df['cluster'].nunique() - 1} clusters.")
+        print(f"{df[df['cluster'] != -1]['text'].count()} clustered and "
+              f"{df[df['cluster'] == -1]['text'].count()} unclustered sentences.")
+
+        curr_iter += 1
+        print(f"iteration {curr_iter} complete.\n")
+
+    print("Now trying to match the remaining sentences to existing clusters.\n")
+    while curr_iter < max_iter_new_clusters + max_iter_existing_clusters:
+        curr_quantile = linear_interpolation(min_val=max_quantile_new_clusters,
+                                             max_val=max_quantile,
+                                             steps=max_iter_existing_clusters,
+                                             step=curr_iter - max_iter_new_clusters + 1)
+        print(f"Starting to cluster the unclustered sentences using the {round(curr_quantile, 2)} quantile as radius.")
+
+        df = dbscan_clustering(df, quantile=curr_quantile, min_size=int(min_size),
+                               prioritize_unclustered=False, create_clusters=False)
         print(f"{df[df['cluster'] != -1]['text'].count()} clustered and "
               f"{df[df['cluster'] == -1]['text'].count()} unclustered sentences.")
 
@@ -310,8 +320,11 @@ def analyze_unrecognized_requests(data_file, output_file, min_size):
     dims = 3
     reduce_dimensions(df, dims)
 
+    # wait for the spacy pipeline to be ready
+    nlp = nlp_async.get()
+
     # give each cluster a title based on the sentences in the cluster
-    title_clusters_dataframe(df)
+    title_clusters_dataframe(df, nlp)
 
     # save the clustering results to a json file
     dataframe_to_json(df, output_file)
