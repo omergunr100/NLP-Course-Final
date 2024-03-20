@@ -17,6 +17,7 @@ def clean_query(query: str) -> str:
 def read_lines(filename: str) -> DataFrame:
     df = pd.read_csv(filename, index_col='id')
     df['text'] = df['text'].map(clean_query)
+    df['cluster'] = -1
     return df
 
 
@@ -64,7 +65,9 @@ def calculate_centroids(df: DataFrame, clusters: dict):
 
 
 # iterate over the data and cluster the requests
-def cluster_requests(df: DataFrame, threshold: float) -> tuple[DataFrame, dict]:
+def cluster_requests(df: DataFrame, threshold: float) -> tuple[DataFrame, dict, bool]:
+    converged = True
+
     # shuffle the data
     df = df.sample(frac=1)
 
@@ -80,30 +83,45 @@ def cluster_requests(df: DataFrame, threshold: float) -> tuple[DataFrame, dict]:
 
         # get the row
         encoded = df.at[df.index[i], 'encoded']
+        cluster = df.at[df.index[i], 'cluster']
 
-        # find the most similar cluster to the sample
-        min_distance = float('inf')
-        min_cluster_id = -1
-        for key, value in clusters.items():
-            similarity = np.linalg.norm(encoded - value['centroid'])
-            if similarity < min_distance:
-                min_distance = similarity
-                min_cluster_id = key
+        # if the request is already clustered, check if it's still within the radius
+        if cluster != -1:
+            distance = np.linalg.norm(encoded - clusters[cluster]['centroid'])
+            # if the request is outside the radius, remove it from the cluster
+            if distance > threshold:
+                clusters[cluster]['requests'].remove(df.index[i])
+                clusters[cluster]['modified'] = True
+                cluster = -1
 
-        # if the similarity is less than the threshold, add the request to the cluster
-        if min_distance < threshold:
-            clusters[min_cluster_id]['requests'].add(df.index[i])
-            clusters[min_cluster_id]['modified'] = True
-        # else, create a new cluster
-        else:
-            clusters[max_key] = {
-                'centroid': encoded,
-                'requests': {df.index[i]},
-                'modified': False
-            }
-            max_key += 1
+        # if sample is unclustered, find the most similar cluster or create a new one
+        if cluster == -1:
+            # if the sample is unclustered, the algorithm has not converged
+            converged = False
 
-    return df, clusters
+            # find the closest cluster to the sample
+            min_distance = float('inf')
+            min_cluster_id = -1
+            for key, value in clusters.items():
+                distance = np.linalg.norm(encoded - value['centroid'])
+                if distance < min_distance:
+                    min_distance = distance
+                    min_cluster_id = key
+
+            # if the distance is within the threshold, add the request to the cluster
+            if min_distance < threshold:
+                clusters[min_cluster_id]['requests'].add(df.index[i])
+                clusters[min_cluster_id]['modified'] = True
+            # else, create a new cluster
+            else:
+                clusters[max_key] = {
+                    'centroid': encoded,
+                    'requests': {df.index[i]},
+                    'modified': False
+                }
+                max_key += 1
+
+    return df, clusters, converged
 
 
 # transform the clusters into the required format
@@ -141,7 +159,19 @@ def analyze_unrecognized_requests(data_file, output_file, min_size):
     encode_sentences(df, model)
 
     # cluster the requests
-    df, clusters = cluster_requests(df, 0.756)
+    df, clusters, converged = cluster_requests(df, 0.756)
+    iteration = 0
+    max_iterations = 100
+    while (not converged) and (iteration < max_iterations):
+        df, clusters, converged = cluster_requests(df, 0.756)
+        calculate_centroids(df, clusters)
+        iteration += 1
+        print(f"Iteration {iteration} completed")
+
+    if converged:
+        print(f"Converged after {iteration} iterations")
+    else:
+        print(f"Did not converge after {max_iterations} iterations, maximum number of iterations reached.")
 
     # transform the clusters into the required format
     result = transform_clusters_dict(df, clusters, int(min_size))
