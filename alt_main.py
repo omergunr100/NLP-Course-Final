@@ -1,9 +1,16 @@
 import json
+import string
 
+import benepar
+import en_core_web_md
 import numpy as np
 import pandas as pd
 from pandas import DataFrame
+from plotly.graph_objs import Figure
 from sentence_transformers import SentenceTransformer
+from sklearn.decomposition import PCA
+from spacy import Language
+import plotly.express as px
 
 from compare_clustering_solutions import evaluate_clustering
 
@@ -67,15 +74,6 @@ def count_closest_neighbors(df: DataFrame, threshold: float):
             if min_distance == df.at[j_idx, f"{i_idx}_distance"]:
                 # if it is, increment the closest neighbors count
                 df.at[j_idx, 'closest_neighbors'] += 1
-
-
-# find the radius which encompasses the n closest neighbors
-def find_radius(df: DataFrame, n: int):
-    df['radius'] = pd.NA
-    df_dist = df[[col for col in df.columns if '_distance' in col]]
-    for i in range(len(df)):
-        index = df.index[i]
-        df.at[index, 'radius'] = np.partition(df_dist[df_dist.index == index].to_numpy().flatten(), n)[n - 1]
 
 
 # calculate centroids for the modified clusters
@@ -149,6 +147,45 @@ def cluster_requests(df: DataFrame, clusters: dict, threshold: float, sort_by_co
     return num_changes
 
 
+# give a title to a cluster
+def title_clusters(df: DataFrame, clusters: dict, nlp: Language, min_size: int):
+    df['title'] = 'cluster_' + df['cluster'].astype(str)
+    for cluster in clusters.keys():
+        # if the cluster size is below the threshold, set the title to unclustered
+        if len(clusters[cluster]['requests']) < min_size:
+            df.loc[df['cluster'] == cluster, 'title'] = 'unclustered'
+            df.loc[df['cluster'] == cluster, 'cluster'] = -1
+            continue
+
+        # get all sentences in the cluster to a list
+        sentence_list = df.loc[df['cluster'] == cluster, 'text'].to_list()
+        # strip the sentences of any extra spaces (anywhere) and periods (at the end)
+        sentence_list = [' '.join(sentence.split()).strip('.') for sentence in sentence_list]
+        # concatenate the sentences and make sure that they end with punctuation
+        paragraph = ' '.join([sentence if sentence.endswith(string.punctuation) else sentence + '.'
+                              for sentence in sentence_list])
+        # analyze the concatenated sentences (the entire cluster)
+        doc = nlp(paragraph)
+
+        # initialize the max similarity and the max string
+        max_sim = float('-inf')
+        max_str = ""
+
+        # find the single-standalone sentence that is the most similar to all the sentences concatenated
+        for sent in doc.sents:
+            for constituent in sent._.constituents:
+                if 2 < len(constituent) < 8:
+                    if (similarity := doc.similarity(constituent)) > max_sim:
+                        max_sim = similarity
+                        max_str = constituent.text
+
+        # set the most similar as the title
+        title = max_str.strip('.')
+        if title != '':
+            df.loc[df['cluster'] == cluster, 'title'] = title
+            clusters[cluster]['title'] = title
+
+
 # transform the clusters into the required format
 def transform_clusters_dict(df: DataFrame, clusters: dict, min_size: int) -> dict:
     cluster_list = []
@@ -157,7 +194,7 @@ def transform_clusters_dict(df: DataFrame, clusters: dict, min_size: int) -> dic
         # if the cluster size is greater than the threshold, add it to the result
         if len(value['requests']) > min_size:
             cluster_list.append({
-                'cluster_name': f'cluster_{key}',
+                'cluster_name': value['title'] if 'title' in value else f'Cluster {key}',
                 'requests': df[df.index.isin(value['requests'])]['text'].tolist()
             })
         # else, add the requests to the unclustered list
@@ -191,6 +228,45 @@ def destroy_below_min_size(df: DataFrame, clusters: dict, min_size: int) -> tupl
         del clusters[key]
 
     return len(to_destroy), num_requests
+
+
+# prepare the spacy pipeline for the naming part of the task
+def prepare_spacy_pipeline() -> Language:
+    # load the spaCy model
+    benepar.download('benepar_en3')
+    nlp = en_core_web_md.load()
+    # load the benepar parser
+    nlp.add_pipe("benepar", config={"model": "benepar_en3"})
+
+    return nlp
+
+
+# reduces the dimensionality of the data to k dimensions
+def reduce_dimensions(df: DataFrame, dims: int):
+    pca = PCA(n_components=dims)
+    reduced = pca.fit_transform(df['encoded'].to_list())
+    for i in range(dims):
+        df[f'reduced{str(i)}'] = reduced[:, i]
+
+
+# plot results - plotly
+def plot_results(df: DataFrame,
+                 title: str = 'Clustering Results',
+                 axis: tuple[str, str, str] | None = ('reduced0', 'reduced1', 'reduced2'),
+                 color: str = 'cluster') -> Figure:
+    x, y, z = axis
+    fig = px.scatter_3d(df, x=x, y=y, z=z,
+                        title=title,
+                        hover_data={
+                            'text': True,
+                            'title': True,
+                            x: True,
+                            y: True,
+                            z: True
+                        },
+                        size_max=1.5,
+                        color=color if color in df else None)
+    return fig
 
 
 def analyze_unrecognized_requests(data_file, output_file, min_size):
@@ -246,13 +322,24 @@ def analyze_unrecognized_requests(data_file, output_file, min_size):
     else:
         print(f"Did not converge after {max_iterations} iterations, maximum number of iterations reached.\n")
 
+    # prepare the spacy pipeline
+    nlp = prepare_spacy_pipeline()
+
+    # title the clusters
+    title_clusters(df, clusters, nlp, int(min_size))
+
     # transform the clusters into the required format
     result = transform_clusters_dict(df, clusters, int(min_size))
 
+    # reduce the dimensions of the data for visualization
+    reduce_dimensions(df, 3)
+
+    # plot the results
+    fig = plot_results(df, title='Clustering Results', axis=('reduced0', 'reduced1', 'reduced2'), color='title')
+    fig.write_html(f'clustering_results.html')
+
     # output the result to a json file
     output_result(result, output_file)
-
-    return result
 
 
 if __name__ == '__main__':
