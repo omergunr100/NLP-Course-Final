@@ -42,9 +42,31 @@ def calculate_distances(df: DataFrame):
 
 
 # find the closest neighbors for each request
-def find_closest_neighbor(df: DataFrame):
+def find_closest_neighbor_distance(df: DataFrame):
     distance_columns = [col for col in df.columns if '_distance' in col]
     df['closest_neighbor_distance'] = df.loc[:, df.columns.isin(distance_columns)].min(axis=1)
+
+
+# count closest neighbors for each request
+def count_closest_neighbors(df: DataFrame, threshold: float):
+    df['closest_neighbors'] = 0
+    # iterate over the data
+    for i in range(len(df)):
+        i_idx = df.index[i]
+        # find the closest neighbor distance
+        min_distance = df.at[i_idx, 'closest_neighbor_distance']
+        # if the distance is greater than the threshold, skip the request
+        if min_distance > threshold:
+            continue
+        # iterate over the data
+        for j in range(len(df)):
+            if i == j:
+                continue
+            # check if the distance is the closest
+            j_idx = df.index[j]
+            if min_distance == df.at[j_idx, f"{i_idx}_distance"]:
+                # if it is, increment the closest neighbors count
+                df.at[j_idx, 'closest_neighbors'] += 1
 
 
 # find the radius which encompasses the n closest neighbors
@@ -65,15 +87,17 @@ def calculate_centroids(df: DataFrame, clusters: dict):
 
 
 # iterate over the data and cluster the requests
-def cluster_requests(df: DataFrame, threshold: float) -> tuple[DataFrame, dict, bool]:
-    converged = True
+def cluster_requests(df: DataFrame, clusters: dict, threshold: float, sort_by_count: bool = False) -> int:
+    num_changes = 0
 
     # shuffle the data
-    df = df.sample(frac=1)
+    if sort_by_count:
+        order = df.sort_values(by='closest_neighbors', ascending=False).index
+    else:
+        order = df.sample(frac=1).index
 
     # create a dictionary to store the clusters
-    clusters = dict()
-    max_key = 0
+    max_key = max(clusters.keys(), default=-1) + 1
 
     # iterate over the data
     for i in range(len(df)):
@@ -82,46 +106,47 @@ def cluster_requests(df: DataFrame, threshold: float) -> tuple[DataFrame, dict, 
             calculate_centroids(df, clusters)
 
         # get the row
-        encoded = df.at[df.index[i], 'encoded']
-        cluster = df.at[df.index[i], 'cluster']
+        encoded = df.at[order[i], 'encoded']
+        cluster = df.at[order[i], 'cluster']
 
-        # if the request is already clustered, check if it's still within the radius
-        if cluster != -1:
-            distance = np.linalg.norm(encoded - clusters[cluster]['centroid'])
-            # if the request is outside the radius, remove it from the cluster
-            if distance > threshold:
-                clusters[cluster]['requests'].remove(df.index[i])
+        # find the closest cluster to the sample
+        min_distance = float('inf')
+        min_cluster_id = -1
+        for key, value in clusters.items():
+            distance = np.linalg.norm(encoded - value['centroid'])
+            if distance < min_distance:
+                min_distance = distance
+                min_cluster_id = key
+
+        # if the distance is within the threshold, add the request to the cluster
+        if min_distance < threshold:
+            df.at[order[i], 'cluster'] = min_cluster_id
+            clusters[min_cluster_id]['requests'].add(order[i])
+            clusters[min_cluster_id]['modified'] = True
+
+            if cluster != min_cluster_id:
+                num_changes += 1
+                # remove the request from the previous cluster
+                if cluster != -1:
+                    clusters[cluster]['requests'].remove(order[i])
+                    clusters[cluster]['modified'] = True
+
+        # else, create a new cluster
+        else:
+            num_changes += 1
+            df.at[order[i], 'cluster'] = max_key
+            clusters[max_key] = {
+                'centroid': encoded,
+                'requests': {order[i]},
+                'modified': False
+            }
+            max_key += 1
+            # remove the request from the previous cluster
+            if cluster != -1:
+                clusters[cluster]['requests'].remove(order[i])
                 clusters[cluster]['modified'] = True
-                cluster = -1
 
-        # if sample is unclustered, find the most similar cluster or create a new one
-        if cluster == -1:
-            # if the sample is unclustered, the algorithm has not converged
-            converged = False
-
-            # find the closest cluster to the sample
-            min_distance = float('inf')
-            min_cluster_id = -1
-            for key, value in clusters.items():
-                distance = np.linalg.norm(encoded - value['centroid'])
-                if distance < min_distance:
-                    min_distance = distance
-                    min_cluster_id = key
-
-            # if the distance is within the threshold, add the request to the cluster
-            if min_distance < threshold:
-                clusters[min_cluster_id]['requests'].add(df.index[i])
-                clusters[min_cluster_id]['modified'] = True
-            # else, create a new cluster
-            else:
-                clusters[max_key] = {
-                    'centroid': encoded,
-                    'requests': {df.index[i]},
-                    'modified': False
-                }
-                max_key += 1
-
-    return df, clusters, converged
+    return num_changes
 
 
 # transform the clusters into the required format
@@ -148,6 +173,26 @@ def output_result(result: dict, filename: str):
         json.dump(result, fout, indent=4)
 
 
+# remove clusters below the minimum size from the dictionary
+def destroy_below_min_size(df: DataFrame, clusters: dict, min_size: int) -> tuple[int, int]:
+    to_destroy = []
+    num_requests = 0
+    # search for clusters below the minimum size
+    for key, value in clusters.items():
+        if len(value['requests']) < min_size:
+            # remove the requests from the cluster
+            for request in value['requests']:
+                df.at[request, 'cluster'] = -1
+            to_destroy.append(key)
+            num_requests += len(value['requests'])
+
+    # remove the clusters from the dictionary
+    for key in to_destroy:
+        del clusters[key]
+
+    return len(to_destroy), num_requests
+
+
 def analyze_unrecognized_requests(data_file, output_file, min_size):
     # read the data
     df = read_lines(data_file)
@@ -158,20 +203,48 @@ def analyze_unrecognized_requests(data_file, output_file, min_size):
     # encode the sentences
     encode_sentences(df, model)
 
-    # cluster the requests
-    df, clusters, converged = cluster_requests(df, 0.756)
-    iteration = 0
-    max_iterations = 100
-    while (not converged) and (iteration < max_iterations):
-        df, clusters, converged = cluster_requests(df, 0.756)
-        calculate_centroids(df, clusters)
-        iteration += 1
-        print(f"Iteration {iteration} completed")
+    # calculate the distances
+    calculate_distances(df)
 
-    if converged:
-        print(f"Converged after {iteration} iterations")
+    # find the closest neighbors for each request
+    find_closest_neighbor_distance(df)
+
+    # count closest neighbors for each request
+    count_closest_neighbors(df, 0.756)
+
+    # initialize the clusters dictionary
+    clusters = dict()
+    max_iterations = 100
+    # initial values to prevent errors
+    num_changes = 1
+    iteration = None
+    destroy_below_threshold = True
+    # cluster the requests
+    for iteration in range(max_iterations):
+        # cluster the requests
+        num_changes = cluster_requests(df=df,
+                                       clusters=clusters,
+                                       threshold=0.756,
+                                       sort_by_count=iteration % 5 == 0)
+        print(f"Number of changes: {num_changes}")
+
+        # remove clusters below the minimum size the first time the number of changes is 0
+        if num_changes == 0 and destroy_below_threshold and iteration < max_iterations - 1:
+            destroy_below_threshold = False
+            num_clusters, num_requests = destroy_below_min_size(df, clusters, int(min_size))
+            print(f"Removed {num_clusters} clusters below the minimum size, with a total of {num_requests} requests.")
+            num_changes = num_requests
+
+        print(f"Iteration {iteration + 1} completed\n")
+
+        # if the number of changes is 0, the algorithm has converged
+        if num_changes == 0:
+            break
+
+    if num_changes == 0:
+        print(f"Converged after {iteration + 1} iterations.\n")
     else:
-        print(f"Did not converge after {max_iterations} iterations, maximum number of iterations reached.")
+        print(f"Did not converge after {max_iterations} iterations, maximum number of iterations reached.\n")
 
     # transform the clusters into the required format
     result = transform_clusters_dict(df, clusters, int(min_size))
