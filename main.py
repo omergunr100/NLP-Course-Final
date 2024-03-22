@@ -76,7 +76,7 @@ def title_clusters_dataframe(df: DataFrame, nlp: Language):
         # find the single-standalone sentence that is the most similar to all the sentences concatenated
         for sent in doc.sents:
             for constituent in sent._.constituents:
-                if 'S' in constituent._.labels:
+                if 1 < len(constituent) < 5:
                     if (similarity := doc.similarity(constituent)) > max_sim:
                         max_sim = similarity
                         max_str = constituent.text
@@ -87,11 +87,11 @@ def title_clusters_dataframe(df: DataFrame, nlp: Language):
             df.loc[df['cluster'] == cluster, 'title'] = title
 
 
-# reduces the dimensionality of the data to k dimensions
-def reduce_dimensions(df: DataFrame, dims: int):
-    pca = PCA(n_components=dims)
+# reduces the dimensionality of the data to 3 dimensions
+def reduce_dimensions(df: DataFrame):
+    pca = PCA(n_components=3)
     reduced = pca.fit_transform(df['encoded'].to_list())
-    for i in range(dims):
+    for i in range(3):
         df[f'reduced{str(i)}'] = reduced[:, i]
 
 
@@ -112,7 +112,6 @@ def plot_results(df: DataFrame,
                         },
                         size_max=1.5,
                         color=color if color in df else None)
-    fig.show()
     return fig
 
 
@@ -336,9 +335,8 @@ def analyze_unrecognized_requests(data_file, output_file, min_size):
     # todo: remove timing code
     start_time = time.time()
 
-    # create visualization base
-    dims = 3
-    reduce_dimensions(df, dims)
+    # transform original data to 3d for plotting
+    reduce_dimensions(df)
 
     # wait for the spacy pipeline to be ready
     nlp = nlp_async.get()
